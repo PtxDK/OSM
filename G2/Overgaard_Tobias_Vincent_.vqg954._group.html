@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="generator" content="pandoc">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+  <meta name="author" content="Niels (ngws@metanohi.name)">
+  <title>Correction of G2</title>
+  <style type="text/css">code{white-space: pre;}</style>
+  <!--[if lt IE 9]>
+    <script src="//cdnjs.cloudflare.com/ajax/libs/html5shiv/3.7.3/html5shiv-printshiv.min.js"></script>
+  <![endif]-->
+  <style type="text/css">
+  body {
+    font-family: 'URW Palladio L', 'Palatino', serif;
+    color: #111111;
+    background-color: #eeeeee;
+  }
+  
+  p {
+    width: 800px;
+  }
+  </style>
+</head>
+<body>
+<header>
+<h1 class="title">Correction of G2</h1>
+<h2 class="author">Niels <code>(ngws@metanohi.name)</code></h2>
+</header>
+<h1 id="uh-oh">Uh-oh!</h1>
+<p>Please adhere <em>strictly</em> to the assignment text: Submit a <code>.tar.gz</code> and not a <code>.zip</code>. (We’re GNU/Linux folks here, not Windows end users.)</p>
+<h1 id="task-1-userland-processes">Task 1: Userland processes</h1>
+<p>Your <code>process_exit</code> doesn’t call <code>sleepq_wake</code> – which is necessary to wake up the waiting <code>process_join</code>.</p>
+<p>I don’t see a need for the <code>DEAD</code> state.</p>
+<p>The <em>main</em> problem in your <code>process_spawn</code> is that the <code>entry_point</code> and <code>stack_top</code> used by the new process must be available forever, but you use the automatically ones from inside <code>process_spawn</code>, which will get automatically deallocated once the function returns. You need to store these two attributes somewhere static, e.g. in the process table. They are used for storing the low-level state of a process when the scheduler switches threads.</p>
+<p>In pseudocode, this is what I would to do for the different types and functions. Apologies if I write about something which you’ve already done correctly (in which case I probably just missed that).</p>
+<h2 id="the-states">The states</h2>
+<pre><code>typedef enum {
+    PROCESS_FREE,
+    PROCESS_RUNNING,
+    PROCESS_ZOMBIE
+} process_state_t;</code></pre>
+<p>You only really need three states: <code>PROCESS_FREE</code> to describe that the slot is available, <code>PROCESS_RUNNING</code> to describe that it’s currently in use, and <code>PROCESS_ZOMBIE</code> to describe that it’s dead, but that the parent might still join it to get its return value, which the child process has itself set beforing going into the zombie state.</p>
+<p>If our process abstraction was more powerful, e.g. with an advanced filesystem, we might like to have more states. But for our basic process support, these three are enough.</p>
+<h2 id="the-struct">The struct</h2>
+<pre><code>typedef struct {
+/* We need to keep track of a process&#39; state to make sure calls to eg. `join` do
+ * the right thing. */
+  process_state_t state;
+
+/* A parent should be able to get a child&#39;s return value after it exits, so we
+ * store it here. */
+  int retval;
+
+/* Initial contents of some registers.  We need to store these somewhere in
+ * always-available memory, so we might as well do it here. */
+  virtaddr_t entry_point;
+  virtaddr_t stack_top;
+
+} process_control_block_t;</code></pre>
+<p>If you want to add a bit of error detection, you can also store the PID of the parent, since only a process’ parent should be able to interface with itself.</p>
+<h2 id="process_spawn"><code>process_spawn</code></h2>
+<pre><code>/* Load and run the executable as a new process in a new thread
+ * Argument: executable file name; Returns: process ID of the new process */
+process_id_t process_spawn(char const* executable, char const **argv)
+{
+  interrupt_status_t intr_status;
+  TID_t thread;
+  process_id_t pid;
+  int ret;
+
+  /* Disable interrupts, and lock the entire process table.  You need to have
+   * defined a spinlock for this for this to work.
+   */
+  intr_status = _interrupt_disable();
+  spinlock_acquire(&amp;some_spinlock);
+
+  pid = find an empty spot;
+
+  /* Spawn a new thread, and make it start in `process_run`.  Don&#39;t actually run
+   * the thread yet.  Type casting of functions in C is horrible.
+   */
+  thread = thread_create((void (*)(uint32_t))(&amp;process_run), pid);
+
+  /* Before we start running the new thread, we have to load the executable into
+   * memory.  Technically, we could also do this in the new thread, but we would
+   * have to copy over memory to the new thread (e.g. `executable` and `argv`),
+   * since right now they reside only in the memory of the old thread.
+   */
+  ret = setup_new_process(...);
+
+  /* We are now done modifying the process table, so unlock it. */
+  spinlock_release(&amp;some_spinlock);
+  _interrupt_set_state(intr_status);
+
+  /* Run the thread. */
+  thread_run(thread);
+
+  return ret;
+}
+
+void process_run(process_id_t pid)
+{
+  /* This function needs to do the same thing as the bottom of `process_start`,
+   * but instead of working on the old thread, it should work on the new
+   * thread.  Also, while `process_start` stores `user_context` and `stack_top`
+   * on the call stack, in our approach they are stored in the process struct.
+   */
+
+  set pagetable;
+  initialize user context;
+  goto userland;
+}</code></pre>
+<p>In short, <code>process_spawn</code> should make the new thread, load the executable into its memory, and start the new thread. You should not have to modify <code>setup_new_process</code>. Again, you’re very welcome to do some more error checks.</p>
+<h2 id="process_exit"><code>process_exit</code></h2>
+<pre><code>/* Stop the current process and the kernel thread in which it runs
+ * Argument: return value */
+void process_exit(int retval) {
+  process_id_t cur = process_get_current_process();
+  thread_table_t *thread = thread_get_current_thread_entry();
+
+  lock the process table;
+
+  set the current process state to ZOMBIE;
+  save the retval in the current process table entry;
+
+  /* Destroy the pagetable.  We don&#39;t need the memory anymore. */
+  vm_destroy_pagetable(thread-&gt;pagetable);
+  thread-&gt;pagetable = NULL;
+
+  /* Send a message to a waiting `process_join` that the data in the process
+   * block has changed.  Here, we use the pointer to the process block as the
+   * sleep queue resource.  The only requirement for the resource is that we can
+   * also use it in `process_join` when calling `sleepq_add`.
+   */
+  sleepq_wake_all(&amp;process_table[cur]);
+
+  unlock the process table;
+
+  /* Destroy the current thread. */
+  thread_finish();
+}</code></pre>
+<p>The main purpose of <code>process_exit</code> is to save its return value <code>retval</code> and then signal any waiting <code>process_join</code> call that something has changed.</p>
+<h2 id="process_join"><code>process_join</code></h2>
+<pre><code>/* Wait for the given process to terminate, return its return value,
+ * and mark the process-table entry as free. */
+int process_join(process_id_t pid) {
+  check if the pid seems valid;
+
+  lock the process table;
+
+  while (the state of the pid process is not PROCESS_ZOMBIE) {
+      /* Use the code structure from
+       * &lt;https://kudos.readthedocs.org/en/latest/advanced-synchronization.html#sleeping-on-a-resource&gt;.
+       * Use the same resource as in `process_exit`, so that `process_join`
+       * knows what it should wait for.
+       */
+    }
+
+  get the retval of the process at pid;
+
+  /* The child is done.  It can only have one parent, so we don&#39;t need its
+   * slot anymore.
+   */
+  set the state of the current process to PROCESS_FREE;
+
+  unlock the process table;
+
+  return the gotten retval;
+}</code></pre>
+<p><code>process_join</code> should wait for <code>process_exit</code> and nothing else. If <code>process_exit</code> has already been called, then it shouldn’t wait, but that is also handled by the while loop.</p>
+<h2 id="process_init"><code>process_init</code></h2>
+<pre><code>/* Initialize process table.
+ * Should be called before any other process-related calls */
+void process_init(void) {
+  loop through the process table and set the state of all slots;
+}</code></pre>
+<p>You need to make KUDOS call this on startup. KUDOS startup happens in <code>init/common.c</code>, so put it somewhere in that file.</p>
+<h2 id="process_get_current_process"><code>process_get_current_process</code></h2>
+<pre><code>/* Return PID of current process. */
+process_id_t process_get_current_process(void) {
+  fetch the pid from wherever you stored in in the thread struct;
+}</code></pre>
+<h2 id="process_get_current_process_entry"><code>process_get_current_process_entry</code></h2>
+<pre><code>/* Return PCB of current process. */
+process_control_block_t *process_get_current_process_entry(void) {
+  use process_get_current_process;
+}</code></pre>
+<h1 id="task-2-syscalls-for-userland-processes">Task 2: Syscalls for userland processes</h1>
+<p>The syscalls look fine.</p>
+<p>I would like a test program that spawns e.g. “[disk]hw.mips32”, then joins it to wait for it to finish, and then prints the return value.</p>
+<h1 id="conclusion">Conclusion</h1>
+<p>Please resubmit. Fix task 1, and show that it’s working.</p>
+</body>
+</html>
